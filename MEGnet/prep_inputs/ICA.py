@@ -802,7 +802,7 @@ def classify_ica(results_dir=None, outbasename=None, filename=None):
     Returns
     -------
     dict
-        dictionary with keys: (classes, bads_idx)
+        dictionary with keys: (classes, bads_idx, class_probabilities)
 
     '''
     from scipy.io import loadmat
@@ -827,11 +827,14 @@ def classify_ica(results_dir=None, outbasename=None, filename=None):
     arrSP_fnames = [op.join(results_dir, f'component{i}.mat') for i in range(1,21)]
     arrTS = loadmat(op.join(results_dir, 'ICATimeSeries.mat'))['arrICATimeSeries'].T
     arrSP = np.stack([loadmat(i)['array'] for i in arrSP_fnames])
-    preds, probs = fPredictChunkAndVoting_parrallel(kModel, arrTS, arrSP)
+    preds, _ = fPredictChunkAndVoting_parrallel(kModel, arrTS, arrSP)
     meg_rest_ica_classes = preds.argmax(axis=1)
     ica_comps_toremove = [index for index, value in enumerate(meg_rest_ica_classes) if value in [1, 2, 3]]
-    return {'classes':meg_rest_ica_classes,
-            'bads_idx': ica_comps_toremove}
+    return {
+        'classes': meg_rest_ica_classes,
+        'bads_idx': ica_comps_toremove,
+        'class_probabilities': preds,
+    }
 
 def clean_ica(bad_comps=None, results_dir=None, outbasename=None,
               raw_dataset=None):         # Remove identified ICA components    
@@ -941,4 +944,3 @@ if __name__ == '__main__':
     
     
     
-
