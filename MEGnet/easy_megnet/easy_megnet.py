@@ -40,7 +40,6 @@ def _bootstrap_package_root() -> None:
 _bootstrap_package_root()
 
 from MEGnet.megnet_init import main as megnet_init
-from MEGnet.prep_inputs.ICA import classify_ica
 from MEGnet.prep_inputs.ICA import load_data
 from MEGnet.prep_inputs.ICA import main as run_ica_pipeline
 
@@ -53,6 +52,25 @@ CLASS_ID_TO_NAME = {
     2: "Cardiac (ECG/EKG)",
     3: "Horizontal eye movement (saccade/HEOG)",
 }
+PROBABILITY_PRINT_PRECISION = 12
+
+
+def _fmt_float(value: float, precision: int = PROBABILITY_PRINT_PRECISION) -> str:
+    if not np.isfinite(float(value)):
+        return ""
+    return f"{float(value):.{precision}g}"
+
+
+def _class_id_to_prob_col(class_id: int) -> str:
+    if class_id == 0:
+        return "prob_class0_neural_other"
+    if class_id == 1:
+        return "prob_class1_blink_veog"
+    if class_id == 2:
+        return "prob_class2_cardiac_ecg"
+    if class_id == 3:
+        return "prob_class3_saccade_heog"
+    return f"prob_class{class_id}"
 
 
 def _file_base(filename: str, outbasename: str | None) -> str:
@@ -78,21 +96,89 @@ def _sanitize_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
-def _pick_reference_channels(raw: mne.io.BaseRaw, kind: str) -> np.ndarray:
+def _parse_channel_list(value: str | None) -> list[str]:
+    if value is None:
+        return []
+    out = [x.strip() for x in re.split(r"[,;]", value) if x.strip()]
+    return out
+
+
+def _get_meg_system(raw: mne.io.BaseRaw) -> str:
+    try:
+        from mne.channels.channels import _get_meg_system
+
+        return str(_get_meg_system(raw.info))
+    except Exception:
+        return ""
+
+
+def _is_ctf_system(raw: mne.io.BaseRaw) -> bool:
+    return "CTF" in _get_meg_system(raw).upper()
+
+
+def _pick_by_channel_name(raw: mne.io.BaseRaw, channel_names: list[str]) -> np.ndarray:
+    if len(channel_names) == 0:
+        return np.array([], dtype=int)
+
+    name_to_idx = {name.upper(): idx for idx, name in enumerate(raw.ch_names)}
+    picks: list[int] = []
+    for channel_name in channel_names:
+        key = channel_name.strip().upper()
+        if key in name_to_idx:
+            picks.append(name_to_idx[key])
+            continue
+        # Allow partial matching to accommodate vendor-specific naming variants.
+        partial = [idx for idx, ch_name in enumerate(raw.ch_names) if key in ch_name.upper()]
+        picks.extend(partial)
+
+    if len(picks) == 0:
+        return np.array([], dtype=int)
+    return np.asarray(sorted(set(picks)), dtype=int)
+
+
+def _pick_reference_channels(
+    raw: mne.io.BaseRaw,
+    kind: str,
+    preferred_channel_names: list[str] | None = None,
+) -> np.ndarray:
+    preferred_channel_names = preferred_channel_names or []
+    preferred_picks = _pick_by_channel_name(raw, preferred_channel_names)
+    if len(preferred_picks) > 0:
+        return preferred_picks
+
     if kind == "ecg":
         picks = mne.pick_types(raw.info, meg=False, eeg=False, ecg=True, eog=False, ref_meg=False)
         if len(picks) > 0:
             return picks
-        keys = ("ECG", "EKG")
+        keys = ("ECG", "EKG", "HEART", "CARD", "PULSE", "PPG")
     elif kind == "eog":
         picks = mne.pick_types(raw.info, meg=False, eeg=False, ecg=False, eog=True, ref_meg=False)
         if len(picks) > 0:
             return picks
-        keys = ("EOG", "HEOG", "VEOG")
+        keys = ("EOG", "HEOG", "VEOG", "EYE", "BLINK")
     else:
         return np.array([], dtype=int)
 
-    fallback = [idx for idx, name in enumerate(raw.ch_names) if any(key in name.upper() for key in keys)]
+    fallback = []
+    for idx, name in enumerate(raw.ch_names):
+        desc = str(raw.info["chs"][idx].get("desc", ""))
+        probe = f"{name} {desc}".upper()
+        if any(key in probe for key in keys):
+            fallback.append(idx)
+
+    if len(fallback) == 0 and _is_ctf_system(raw):
+        system = _get_meg_system(raw) or "CTF"
+        if kind == "ecg":
+            print(
+                f"{system} dataset detected: no ECG channel could be inferred automatically. "
+                "If ECG is stored as EEG/misc, pass --ecg-channel."
+            )
+        else:
+            print(
+                f"{system} dataset detected: no EOG channel could be inferred automatically. "
+                "If EOG is stored as EEG/misc, pass --eog-channels."
+            )
+
     return np.asarray(fallback, dtype=int)
 
 
@@ -158,6 +244,8 @@ def _run_reference_comparisons(
     classes: list[int],
     output_dir: str,
     max_seconds: float = 60.0,
+    ecg_channel_names: list[str] | None = None,
+    eog_channel_names: list[str] | None = None,
 ) -> dict:
     if not op.exists(raw_fif_path):
         return {"status": "skipped", "reason": f"missing_data_file:{raw_fif_path}"}
@@ -178,7 +266,11 @@ def _run_reference_comparisons(
     plot_paths = []
 
     # Cardiac handling
-    ecg_picks = _pick_reference_channels(raw, "ecg")
+    ecg_picks = _pick_reference_channels(
+        raw,
+        "ecg",
+        preferred_channel_names=ecg_channel_names,
+    )
     ecg_comp_indices = [idx for idx, class_id in enumerate(classes) if class_id == 2]
     if len(ecg_comp_indices) > 0 and len(ecg_picks) > 0:
         cardiac_rows_before = len(rows)
@@ -288,7 +380,11 @@ def _run_reference_comparisons(
             )
 
     # Ocular handling
-    eog_picks = _pick_reference_channels(raw, "eog")
+    eog_picks = _pick_reference_channels(
+        raw,
+        "eog",
+        preferred_channel_names=eog_channel_names,
+    )
     ocular_candidates = {1: [idx for idx, cls in enumerate(classes) if cls == 1], 3: [idx for idx, cls in enumerate(classes) if cls == 3]}
     if len(ocular_candidates[1]) > 0 or len(ocular_candidates[3]) > 0:
         selected = {}
@@ -414,6 +510,232 @@ def _run_reference_comparisons(
         writer.writerows(rows)
 
     return {"status": "ok", "plots": plot_paths, "summary_csv": csv_path}
+
+
+def _classify_ica_with_probabilities(
+    results_dir: str,
+    outbasename: str | None,
+    filename: str,
+) -> tuple[list[int], list[int], np.ndarray]:
+    from scipy.io import loadmat
+    import MEGnet
+    from MEGnet.megnet_utilities import fPredictChunkAndVoting_parrallel
+
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+    from tensorflow import keras
+
+    model_path = op.join(MEGnet.__path__[0], "model_v2")
+    k_model = keras.models.load_model(model_path)
+
+    file_base = outbasename if outbasename is not None else Path(filename).stem
+    run_dir = op.join(results_dir, file_base)
+
+    arr_sp_fnames = [op.join(run_dir, f"component{i}.mat") for i in range(1, 21)]
+    arr_ts = loadmat(op.join(run_dir, "ICATimeSeries.mat"))["arrICATimeSeries"].T
+    arr_sp = np.stack([loadmat(path)["array"] for path in arr_sp_fnames])
+
+    probs_arr, _ = fPredictChunkAndVoting_parrallel(k_model, arr_ts, arr_sp)
+    probs_arr = np.asarray(probs_arr, dtype=float)
+    if probs_arr.ndim != 2:
+        probs_arr = np.reshape(probs_arr, (probs_arr.shape[0], -1))
+
+    # Normalize just in case tiny floating drift exists.
+    row_sums = probs_arr.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    probs_arr = probs_arr / row_sums
+
+    classes = probs_arr.argmax(axis=1).astype(int).tolist()
+    bads_idx = [idx for idx, class_id in enumerate(classes) if class_id in (1, 2, 3)]
+    return classes, bads_idx, probs_arr
+
+
+def _write_probability_table(
+    run_dir: str,
+    classes: list[int],
+    probs: np.ndarray,
+) -> str:
+    out_csv = op.join(run_dir, "component_probabilities.csv")
+    class_cols = [_class_id_to_prob_col(i) for i in range(probs.shape[1])]
+    fieldnames = [
+        "component_index_0based",
+        "component_number_1based",
+        "predicted_class_id",
+        "predicted_class_name",
+        "predicted_class_probability",
+        *class_cols,
+    ]
+
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for idx in range(probs.shape[0]):
+            predicted_class = int(classes[idx])
+            row = {
+                "component_index_0based": idx,
+                "component_number_1based": idx + 1,
+                "predicted_class_id": predicted_class,
+                "predicted_class_name": CLASS_ID_TO_NAME.get(predicted_class, "Unknown"),
+                "predicted_class_probability": _fmt_float(float(probs[idx, predicted_class])),
+            }
+            for class_id, col in enumerate(class_cols):
+                row[col] = _fmt_float(float(probs[idx, class_id]))
+            writer.writerow(row)
+    return out_csv
+
+
+def _parse_bool_cell(value: str) -> bool:
+    return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+
+
+def _load_qc_score_table(table_path: str | None) -> dict[int, dict[str, object]]:
+    out: dict[int, dict[str, object]] = {}
+    if not table_path or not op.exists(table_path):
+        return out
+
+    with open(table_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                comp_idx = int(float(row.get("component_index_0based", "")))
+            except Exception:
+                continue
+
+            try:
+                score = float(row.get("aggregated_abs_score", "nan"))
+            except Exception:
+                score = float("nan")
+
+            out[comp_idx] = {
+                "score": score,
+                "suggested": _parse_bool_cell(row.get("suggested_bad_by_find_bads", "")),
+                "method": row.get("score_source_method", ""),
+            }
+
+    return out
+
+
+def _rank_desc(values: list[float]) -> list[int | None]:
+    arr = np.asarray(values, dtype=float)
+    ranks: list[int | None] = [None] * int(arr.size)
+
+    finite_idx = np.where(np.isfinite(arr))[0]
+    if finite_idx.size == 0:
+        return ranks
+
+    finite_vals = arr[finite_idx]
+    order = np.argsort(-finite_vals, kind="mergesort")
+    prev_val: float | None = None
+    prev_rank = 0
+    for pos, ord_idx in enumerate(order):
+        value = float(finite_vals[ord_idx])
+        if prev_val is None or not np.isclose(value, prev_val, atol=1e-12, rtol=0.0):
+            prev_rank = pos + 1
+            prev_val = value
+        ranks[int(finite_idx[ord_idx])] = prev_rank
+
+    return ranks
+
+
+def _write_combined_ranking_table(
+    run_dir: str,
+    classes: list[int],
+    probs: np.ndarray,
+    qc_score_tables: dict[str, str] | None = None,
+) -> str:
+    out_csv = op.join(run_dir, "component_ranking_combined.csv")
+    n_comp = int(probs.shape[0])
+    class_cols = [_class_id_to_prob_col(i) for i in range(probs.shape[1])]
+
+    qc_score_tables = qc_score_tables or {}
+    ecg_scores_by_comp = _load_qc_score_table(qc_score_tables.get("ECG"))
+    eog_scores_by_comp = _load_qc_score_table(qc_score_tables.get("EOG"))
+
+    def _get_prob(comp_idx: int, class_id: int) -> float:
+        if 0 <= class_id < probs.shape[1]:
+            return float(probs[comp_idx, class_id])
+        return float("nan")
+
+    predicted_probs = []
+    prob_rank_values = {1: [], 2: [], 3: []}
+    ecg_scores = []
+    eog_scores = []
+    for comp_idx in range(n_comp):
+        class_id = int(classes[comp_idx]) if comp_idx < len(classes) else -1
+        predicted_probs.append(_get_prob(comp_idx, class_id))
+        for class_id_rank in prob_rank_values:
+            prob_rank_values[class_id_rank].append(_get_prob(comp_idx, class_id_rank))
+        ecg_scores.append(float(ecg_scores_by_comp.get(comp_idx, {}).get("score", float("nan"))))
+        eog_scores.append(float(eog_scores_by_comp.get(comp_idx, {}).get("score", float("nan"))))
+
+    rank_pred_prob = _rank_desc(predicted_probs)
+    rank_prob_1 = _rank_desc(prob_rank_values[1])
+    rank_prob_2 = _rank_desc(prob_rank_values[2])
+    rank_prob_3 = _rank_desc(prob_rank_values[3])
+    rank_ecg = _rank_desc(ecg_scores)
+    rank_eog = _rank_desc(eog_scores)
+
+    fieldnames = [
+        "component_index_0based",
+        "component_number_1based",
+        "predicted_class_id",
+        "predicted_class_name",
+        "predicted_class_probability",
+        "rank_predicted_class_probability_desc",
+        *class_cols,
+        "rank_prob_class1_blink_veog_desc",
+        "rank_prob_class2_cardiac_ecg_desc",
+        "rank_prob_class3_saccade_heog_desc",
+        "ecg_score",
+        "rank_ecg_score_desc",
+        "ecg_suggested_bad_by_find_bads",
+        "ecg_score_source_method",
+        "eog_score",
+        "rank_eog_score_desc",
+        "eog_suggested_bad_by_find_bads",
+        "eog_score_source_method",
+    ]
+
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for comp_idx in range(n_comp):
+            predicted_class = int(classes[comp_idx]) if comp_idx < len(classes) else -1
+            row = {
+                "component_index_0based": comp_idx,
+                "component_number_1based": comp_idx + 1,
+                "predicted_class_id": predicted_class,
+                "predicted_class_name": CLASS_ID_TO_NAME.get(predicted_class, "Unknown"),
+                "predicted_class_probability": (
+                    _fmt_float(predicted_probs[comp_idx]) if np.isfinite(predicted_probs[comp_idx]) else ""
+                ),
+                "rank_predicted_class_probability_desc": (
+                    rank_pred_prob[comp_idx] if rank_pred_prob[comp_idx] is not None else ""
+                ),
+                "rank_prob_class1_blink_veog_desc": rank_prob_1[comp_idx] if rank_prob_1[comp_idx] is not None else "",
+                "rank_prob_class2_cardiac_ecg_desc": rank_prob_2[comp_idx] if rank_prob_2[comp_idx] is not None else "",
+                "rank_prob_class3_saccade_heog_desc": rank_prob_3[comp_idx] if rank_prob_3[comp_idx] is not None else "",
+                "ecg_score": f"{ecg_scores[comp_idx]:.6f}" if np.isfinite(ecg_scores[comp_idx]) else "",
+                "rank_ecg_score_desc": rank_ecg[comp_idx] if rank_ecg[comp_idx] is not None else "",
+                "ecg_suggested_bad_by_find_bads": bool(
+                    ecg_scores_by_comp.get(comp_idx, {}).get("suggested", False)
+                ),
+                "ecg_score_source_method": str(ecg_scores_by_comp.get(comp_idx, {}).get("method", "")),
+                "eog_score": f"{eog_scores[comp_idx]:.6f}" if np.isfinite(eog_scores[comp_idx]) else "",
+                "rank_eog_score_desc": rank_eog[comp_idx] if rank_eog[comp_idx] is not None else "",
+                "eog_suggested_bad_by_find_bads": bool(
+                    eog_scores_by_comp.get(comp_idx, {}).get("suggested", False)
+                ),
+                "eog_score_source_method": str(eog_scores_by_comp.get(comp_idx, {}).get("method", "")),
+            }
+            for class_id, col in enumerate(class_cols):
+                value = _get_prob(comp_idx, class_id)
+                row[col] = _fmt_float(value) if np.isfinite(value) else ""
+            writer.writerow(row)
+
+    return out_csv
 
 
 def _build_report(file_base: str, classes: list[int], bads_idx: list[int]) -> dict:
@@ -592,6 +914,229 @@ def _run_qc_plotting_fallback(ica_file: str, data_file: str, apply_filter: bool)
     print(f"QC fallback plots written to: {out_dir}")
 
 
+def _apply_qc_filter_if_requested(raw: mne.io.BaseRaw, apply_filter: bool) -> None:
+    if not apply_filter:
+        return
+    lfreq, hfreq = 1.0, 98.0
+    line_freq = raw.info.get("line_freq", None)
+    if line_freq:
+        notch_freqs = np.arange(line_freq, hfreq, line_freq)
+        if len(notch_freqs):
+            raw.notch_filter(
+                notch_freqs,
+                picks=["meg", "eeg", "eog", "ecg"],
+                filter_length="auto",
+                notch_widths=2,
+                trans_bandwidth=1.0,
+                verbose=False,
+            )
+    raw.filter(
+        lfreq,
+        hfreq,
+        picks=["meg", "eeg", "eog", "ecg"],
+        filter_length="auto",
+        method="fir",
+        phase="zero",
+        verbose=False,
+    )
+
+
+def _normalize_qc_scores(scores: np.ndarray, n_comp: int) -> tuple[np.ndarray, np.ndarray | None]:
+    score_arr = np.asarray(scores, dtype=float)
+    if score_arr.size == 0:
+        return np.array([], dtype=float), None
+
+    score_arr = np.squeeze(score_arr)
+    per_ref = None
+    if score_arr.ndim == 1:
+        if score_arr.size == n_comp:
+            per_ref = score_arr.reshape(1, n_comp)
+    elif score_arr.ndim == 2:
+        if score_arr.shape[1] == n_comp:
+            per_ref = score_arr
+        elif score_arr.shape[0] == n_comp:
+            per_ref = score_arr.T
+        elif score_arr.size % n_comp == 0:
+            per_ref = score_arr.reshape(-1, n_comp)
+
+    if per_ref is not None:
+        agg_abs = np.max(np.abs(per_ref), axis=0)
+        return agg_abs, per_ref
+
+    # Generic fallback if dimensions are unexpected.
+    if score_arr.ndim == 1:
+        agg_abs = np.abs(score_arr)
+    else:
+        reduce_axes = tuple(range(score_arr.ndim - 1))
+        agg_abs = np.max(np.abs(score_arr), axis=reduce_axes).reshape(-1)
+
+    if agg_abs.size > n_comp:
+        agg_abs = agg_abs[:n_comp]
+    elif agg_abs.size < n_comp:
+        agg_abs = np.pad(agg_abs, (0, n_comp - agg_abs.size), constant_values=np.nan)
+    return agg_abs, None
+
+
+def _compute_manual_component_scores(
+    ica: mne.preprocessing.ICA,
+    raw: mne.io.BaseRaw,
+    check: str,
+    preferred_channel_names: list[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, list[str]]:
+    n_comp = int(ica.n_components_)
+    ref_picks = _pick_reference_channels(
+        raw,
+        check,
+        preferred_channel_names=preferred_channel_names,
+    )
+    if len(ref_picks) == 0:
+        return np.zeros(n_comp, dtype=float), None, []
+
+    raw_meg = raw.copy().pick_types(meg=True, eeg=False, ref_meg=False)
+    src = ica.get_sources(raw_meg).get_data()
+    ref = raw.get_data(picks=ref_picks)
+    ref_names = [raw.ch_names[idx] for idx in ref_picks]
+
+    n_time = min(src.shape[1], ref.shape[1])
+    src = src[:, :n_time]
+    ref = ref[:, :n_time]
+
+    per_ref = np.zeros((len(ref_picks), n_comp), dtype=float)
+    for ref_idx in range(len(ref_picks)):
+        ref_z = _zscore(ref[ref_idx])
+        for comp_idx in range(n_comp):
+            src_z = _zscore(src[comp_idx])
+            if np.all(ref_z == 0) or np.all(src_z == 0):
+                corr = 0.0
+            else:
+                corr = float(np.corrcoef(src_z, ref_z)[0, 1])
+                if np.isnan(corr):
+                    corr = 0.0
+            per_ref[ref_idx, comp_idx] = corr
+
+    agg_abs = np.max(np.abs(per_ref), axis=0)
+    return agg_abs, per_ref, ref_names
+
+
+def _export_qc_score_tables(
+    ica_file: str,
+    data_file: str,
+    apply_filter: bool,
+    ecg_channel_names: list[str] | None = None,
+    eog_channel_names: list[str] | None = None,
+) -> dict:
+    out_dir = _resolve_qc_out_dir(ica_file=ica_file, data_file=data_file)
+    os.makedirs(out_dir, exist_ok=True)
+    out_tables: dict[str, str] = {}
+
+    ica = mne.preprocessing.read_ica(ica_file)
+    raw = mne.io.read_raw_fif(data_file, allow_maxshield=True, preload=True)
+    _apply_qc_filter_if_requested(raw, apply_filter=apply_filter)
+
+    n_comp = int(ica.n_components_)
+    for check in ("eog", "ecg"):
+        preferred_channel_names = eog_channel_names if check == "eog" else ecg_channel_names
+        ref_picks_for_find = _pick_reference_channels(
+            raw,
+            check,
+            preferred_channel_names=preferred_channel_names,
+        )
+        ref_names_for_find = [raw.ch_names[idx] for idx in ref_picks_for_find]
+
+        method = "find_bads"
+        source_error = ""
+        suggested = set()
+        ref_names: list[str] = []
+        per_ref: np.ndarray | None = None
+        agg_abs: np.ndarray = np.array([], dtype=float)
+
+        try:
+            kwargs = {}
+            if check == "ecg" and len(ref_names_for_find) > 0:
+                kwargs["ch_name"] = ref_names_for_find[0]
+            elif check == "eog" and len(ref_names_for_find) > 0:
+                kwargs["ch_name"] = (
+                    ref_names_for_find[0]
+                    if len(ref_names_for_find) == 1
+                    else ref_names_for_find
+                )
+
+            idxs, scores = getattr(ica, f"find_bads_{check}")(raw, **kwargs)
+            agg_abs, per_ref = _normalize_qc_scores(scores=scores, n_comp=n_comp)
+            suggested = set(int(i) for i in np.asarray(idxs).reshape(-1).tolist())
+            if per_ref is not None:
+                if len(ref_names_for_find) == per_ref.shape[0]:
+                    ref_names = ref_names_for_find
+                else:
+                    ref_names = [f"ref_{i + 1}" for i in range(per_ref.shape[0])]
+            if agg_abs.size == 0:
+                raise RuntimeError("find_bads returned empty scores")
+        except Exception as exc:
+            method = "manual_corr"
+            source_error = str(exc)
+            agg_abs, per_ref, ref_names = _compute_manual_component_scores(
+                ica=ica,
+                raw=raw,
+                check=check,
+                preferred_channel_names=preferred_channel_names,
+            )
+
+        # If no reference channels exist, still emit a numeric table.
+        if agg_abs.size == 0:
+            method = "no_reference_channels"
+            agg_abs = np.zeros(n_comp, dtype=float)
+            per_ref = None
+            ref_names = []
+
+        # Always emit a score plot from the same values used in the table.
+        try:
+            fig, ax = plt.subplots(figsize=(12, 3))
+            ax.bar(np.arange(agg_abs.size), agg_abs, color="tab:gray")
+            ax.set_title(f"ICA component scores ({check.upper()}) [{method}]")
+            ax.set_xlabel("ICA component index")
+            ax.set_ylabel("Score")
+            ax.grid(alpha=0.2)
+            fig.tight_layout()
+            _safe_fig_save(fig, op.join(out_dir, f"score_plot_{check.upper()}.png"))
+        except Exception as plot_exc:
+            print(f"Skipping {check.upper()} score plot export: {plot_exc}")
+
+        table_path = op.join(out_dir, f"score_table_{check.upper()}.csv")
+        fieldnames = [
+            "component_index_0based",
+            "component_number_1based",
+            "suggested_bad_by_find_bads",
+            "aggregated_abs_score",
+            "score_source_method",
+            "reference_channel_names",
+            "score_source_error",
+        ]
+        if per_ref is not None:
+            fieldnames.extend([f"reference_{i + 1}_score" for i in range(per_ref.shape[0])])
+
+        with open(table_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for comp_idx in range(n_comp):
+                row = {
+                    "component_index_0based": comp_idx,
+                    "component_number_1based": comp_idx + 1,
+                    "suggested_bad_by_find_bads": comp_idx in suggested,
+                    "aggregated_abs_score": f"{float(agg_abs[comp_idx]):.6f}",
+                    "score_source_method": method,
+                    "reference_channel_names": ";".join(ref_names),
+                    "score_source_error": source_error,
+                }
+                if per_ref is not None:
+                    for ref_idx in range(per_ref.shape[0]):
+                        row[f"reference_{ref_idx + 1}_score"] = f"{float(per_ref[ref_idx, comp_idx]):.6f}"
+                writer.writerow(row)
+
+        out_tables[check.upper()] = table_path
+
+    return out_tables
+
+
 def _run_qc_plotting(ica_file: str, data_file: str, apply_filter: bool, block: bool) -> None:
     from MEGnet.megnet_qc_plots import plot_all
 
@@ -650,6 +1195,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--bad-channels",
         default="",
         help="Comma-separated channels to drop before ICA (example: MEG0113,MEG2443).",
+    )
+    parser.add_argument(
+        "--ecg-channel",
+        default="",
+        help=(
+            "Optional ECG channel name override (recommended for CTF datasets where ECG is stored "
+            "as EEG/misc)."
+        ),
+    )
+    parser.add_argument(
+        "--eog-channels",
+        default="",
+        help=(
+            "Optional comma-separated EOG channel name overrides (recommended for CTF datasets "
+            "where EOG is stored as EEG/misc)."
+        ),
     )
     parser.add_argument(
         "--classify-only",
@@ -732,6 +1293,10 @@ def main() -> int:
         "input_filename": args.filename,
         "status": "running",
         "stages": {},
+        "reference_channel_overrides": {
+            "ecg": _parse_channel_list(args.ecg_channel),
+            "eog": _parse_channel_list(args.eog_channels),
+        },
     }
     _write_report(report_path, report)
 
@@ -762,6 +1327,11 @@ def main() -> int:
     _write_report(report_path, report)
 
     bad_channels = [x.strip() for x in args.bad_channels.split(",") if x.strip()]
+    ecg_channel_names = _parse_channel_list(args.ecg_channel)
+    eog_channel_names = _parse_channel_list(args.eog_channels)
+    if len(ecg_channel_names) > 1:
+        # `find_bads_ecg` accepts only one channel name; keep the first.
+        ecg_channel_names = ecg_channel_names[:1]
 
     if not args.classify_only:
         try:
@@ -790,12 +1360,29 @@ def main() -> int:
     _write_report(report_path, report)
 
     try:
-        class_output = classify_ica(
+        classes, bads_idx, probs_arr = _classify_ica_with_probabilities(
             results_dir=args.results_dir,
             outbasename=args.outbasename,
             filename=args.filename,
         )
-        report["stages"]["classify"] = {"status": "ok"}
+        prob_table_csv = _write_probability_table(
+            run_dir=results_subdir,
+            classes=classes,
+            probs=probs_arr,
+        )
+        combined_ranking_csv = _write_combined_ranking_table(
+            run_dir=results_subdir,
+            classes=classes,
+            probs=probs_arr,
+            qc_score_tables=None,
+        )
+        report["stages"]["classify"] = {
+            "status": "ok",
+            "probability_table_csv": prob_table_csv,
+            "combined_ranking_csv": combined_ranking_csv,
+        }
+        report["probability_table_csv"] = prob_table_csv
+        report["combined_ranking_csv"] = combined_ranking_csv
     except Exception as exc:
         hint = None
         if "list index out of range" in str(exc):
@@ -814,8 +1401,7 @@ def main() -> int:
             print(hint)
         print(f"Summary report: {report_path}")
         return 1
-    classes = _to_int_list(class_output["classes"])
-    bads_idx = sorted(set(_to_int_list(class_output["bads_idx"])))
+    bads_idx = sorted(set(_to_int_list(bads_idx)))
     report.update(_build_report(file_base=file_base, classes=classes, bads_idx=bads_idx))
     _write_report(report_path, report)
 
@@ -860,18 +1446,69 @@ def main() -> int:
             qc_ica_file = out_ica_applied or (ica_applied_file if op.exists(ica_applied_file) else ica_file)
             if not op.exists(qc_ica_file):
                 raise FileNotFoundError(f"QC plotting requires an ICA file: {qc_ica_file}")
-            _run_qc_plotting(
-                ica_file=qc_ica_file,
-                data_file=preproc_fif,
-                apply_filter=args.qc_apply_filter,
-                block=args.qc_block,
-            )
-            report["qc"] = {"status": "ok", "ica_file": qc_ica_file, "data_file": preproc_fif}
-            report["stages"]["qc"] = {"status": "ok"}
         except Exception as exc:
-            report.setdefault("warnings", []).append(f"QC failed: {exc}")
+            report.setdefault("warnings", []).append(f"QC setup failed: {exc}")
             report["stages"]["qc"] = {"status": "failed", "error": _exc_info(exc)}
-            print(f"QC failed: {exc}")
+            print(f"QC setup failed: {exc}")
+        else:
+            plot_error = None
+            try:
+                _run_qc_plotting(
+                    ica_file=qc_ica_file,
+                    data_file=preproc_fif,
+                    apply_filter=args.qc_apply_filter,
+                    block=args.qc_block,
+                )
+            except Exception as exc:
+                plot_error = exc
+                report.setdefault("warnings", []).append(f"QC plot generation failed: {exc}")
+                print(f"QC plot generation failed: {exc}")
+
+            table_error = None
+            score_tables: dict[str, str] = {}
+            try:
+                score_tables = _export_qc_score_tables(
+                    ica_file=qc_ica_file,
+                    data_file=preproc_fif,
+                    apply_filter=args.qc_apply_filter,
+                    ecg_channel_names=ecg_channel_names,
+                    eog_channel_names=eog_channel_names,
+                )
+            except Exception as exc:
+                table_error = exc
+                report.setdefault("warnings", []).append(f"QC score table export failed: {exc}")
+                print(f"QC score table export failed: {exc}")
+
+            report["qc"] = {
+                "status": "ok" if table_error is None else "partial",
+                "ica_file": qc_ica_file,
+                "data_file": preproc_fif,
+                "score_tables": score_tables,
+            }
+            if score_tables:
+                try:
+                    combined_ranking_csv = _write_combined_ranking_table(
+                        run_dir=results_subdir,
+                        classes=classes,
+                        probs=probs_arr,
+                        qc_score_tables=score_tables,
+                    )
+                    report["combined_ranking_csv"] = combined_ranking_csv
+                    report["qc"]["combined_ranking_csv"] = combined_ranking_csv
+                except Exception as exc:
+                    report.setdefault("warnings", []).append(
+                        f"Combined ranking table export failed: {exc}"
+                    )
+                    print(f"Combined ranking table export failed: {exc}")
+            if plot_error:
+                report["qc"]["plot_error"] = str(plot_error)
+            if table_error:
+                report["qc"]["table_error"] = str(table_error)
+
+            if table_error is None:
+                report["stages"]["qc"] = {"status": "ok"}
+            else:
+                report["stages"]["qc"] = {"status": "failed", "error": _exc_info(table_error)}
     else:
         report["stages"]["qc"] = {"status": "skipped"}
     _write_report(report_path, report)
@@ -885,6 +1522,8 @@ def main() -> int:
                 classes=classes,
                 output_dir=compare_out_dir,
                 max_seconds=float(args.compare_max_seconds),
+                ecg_channel_names=ecg_channel_names,
+                eog_channel_names=eog_channel_names,
             )
             report["reference_comparison"] = compare_info
             report["stages"]["reference_comparison"] = {"status": "ok"}
@@ -904,8 +1543,14 @@ def main() -> int:
     print(f"Predicted class IDs for components 1..20: {classes}")
     print(f"Predicted removable components (0-based): {bads_idx}")
     print(f"Predicted removable components (1-based): {[idx + 1 for idx in bads_idx]}")
+    if "probability_table_csv" in report:
+        print(f"Probability table CSV: {report['probability_table_csv']}")
+    if "combined_ranking_csv" in report:
+        print(f"Combined ranking table CSV: {report['combined_ranking_csv']}")
     if args.run_ref_compare and "reference_comparison" in report:
         print(f"Reference comparison status: {report['reference_comparison'].get('status')}")
+    if "qc" in report and isinstance(report["qc"], dict) and report["qc"].get("score_tables"):
+        print(f"QC score tables: {report['qc']['score_tables']}")
     print(f"Summary report: {report_path}")
     if out_clean is not None and out_ica_applied is not None:
         print(f"ICA-cleaned raw file: {out_clean}")

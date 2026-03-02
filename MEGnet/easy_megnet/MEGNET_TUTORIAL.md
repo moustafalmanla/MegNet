@@ -33,7 +33,9 @@ This workspace includes `easy_megnet.py`, a wrapper around `MEGnet-neuro` (`MEGn
   --line-freq 50 \
   --skip-apply \
   --run-qc \
-  --run-ref-compare
+  --run-ref-compare \
+  --ecg-channel ECG062 \
+  --eog-channels EOG061,EOG062
 ```
 
 ## 4) Flag Reference (Every Flag)
@@ -44,16 +46,18 @@ This workspace includes `easy_megnet.py`, a wrapper around `MEGnet-neuro` (`MEGn
 4. `--filename-raw`: optional non-SSS raw file (mainly for MEGIN bad-channel logic). Example: `--filename-raw /data/sub-001_raw.fif`
 5. `--outbasename`: force output subfolder name. Example: `--outbasename sub-001_task-rest_run-1`
 6. `--bad-channels`: comma-separated channels to drop before ICA. Example: `--bad-channels MEG0113,MEG2443`
-7. `--classify-only`: skip preprocessing/ICA creation and only classify existing MEGnet outputs in the results folder. Example: `--classify-only`
-8. `--skip-init`: skip `megnet_init` model check/download. Example: `--skip-init`
-9. `--skip-apply`: do not apply/remove predicted bad ICs from raw data. Example: `--skip-apply`
-10. `--run-qc`: run QC plotting after classification. Example: `--run-qc`
-11. `--qc-apply-filter`: apply visualization filter during QC. Example: `--run-qc --qc-apply-filter`
-12. `--qc-block`: use blocking plot behavior for QC. Example: `--run-qc --qc-block`
-13. `--run-ref-compare`: generate IC vs ECG/EOG comparison plots. Example: `--run-ref-compare`
-14. `--compare-max-seconds`: seconds shown per comparison trace. Example: `--run-ref-compare --compare-max-seconds 45`
-15. `--compare-out-dir`: custom folder for comparison plots. Example: `--run-ref-compare --compare-out-dir /data/my_compare_plots`
-16. `--report-file`: custom JSON report output path. Example: `--report-file /data/my_report.json`
+7. `--ecg-channel`: optional ECG channel override. Useful for CTF when ECG is stored as EEG/misc. Example: `--ecg-channel EEG057`
+8. `--eog-channels`: optional comma-separated EOG channel overrides. Useful for CTF when EOG is stored as EEG/misc. Example: `--eog-channels EEG058,EEG059`
+9. `--classify-only`: skip preprocessing/ICA creation and only classify existing MEGnet outputs in the results folder. Example: `--classify-only`
+10. `--skip-init`: skip `megnet_init` model check/download. Example: `--skip-init`
+11. `--skip-apply`: do not apply/remove predicted bad ICs from raw data. Example: `--skip-apply`
+12. `--run-qc`: run QC plotting after classification. Example: `--run-qc`
+13. `--qc-apply-filter`: apply visualization filter during QC. Example: `--run-qc --qc-apply-filter`
+14. `--qc-block`: use blocking plot behavior for QC. Example: `--run-qc --qc-block`
+15. `--run-ref-compare`: generate IC vs ECG/EOG comparison plots. Example: `--run-ref-compare`
+16. `--compare-max-seconds`: seconds shown per comparison trace. Example: `--run-ref-compare --compare-max-seconds 45`
+17. `--compare-out-dir`: custom folder for comparison plots. Example: `--run-ref-compare --compare-out-dir /data/my_compare_plots`
+18. `--report-file`: custom JSON report output path. Example: `--report-file /data/my_report.json`
 
 ## 5) Outputs
 
@@ -71,6 +75,8 @@ Core files:
 - `<file_base>_0-ica.fif`
 - `<file_base>_250srate_meg.fif`
 - `megnet_summary.json`
+- `component_probabilities.csv` (per-component class probabilities table; now exported with higher precision)
+- `component_ranking_combined.csv` (combined ranking table: model probabilities + ECG/EOG QC scores)
 - `ica_clean.fif` and `<file_base>_0-ica_applied.fif` (unless `--skip-apply`)
 
 Reference comparison outputs (`--run-ref-compare`):
@@ -90,6 +96,11 @@ QC outputs (`--run-qc`):
 - folder: `MEGnetExtPlots/<data_stem>/`
 - the wrapper first tries MEGnet QC directly
 - if MEGnet QC fails in the environment, wrapper automatically writes fallback QC plots
+- score tables are written when available:
+  - `score_table_ECG.csv`
+  - `score_table_EOG.csv`
+  - these correspond to `score_plot_ECG.png` / `score_plot_EOG.png`
+  - if `find_bads_*` fails, wrapper falls back to manual correlation scores and still writes tables
 
 ## 6) Class IDs
 
@@ -97,6 +108,13 @@ QC outputs (`--run-qc`):
 - `1`: Eye blink (`vEOG`)
 - `2`: Cardiac (`ECG/EKG`)
 - `3`: Horizontal eye movement (`hEOG`/saccade)
+
+`component_probabilities.csv` columns include:
+
+- component index/number
+- predicted class id/name
+- predicted class probability
+- one probability column per class (`prob_class0_*` to `prob_class3_*`)
 
 ## 7) Direct package CLIs (optional)
 
