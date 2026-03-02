@@ -452,6 +452,62 @@ def _build_report(file_base: str, classes: list[int], bads_idx: list[int]) -> di
     }
 
 
+def get_ic_probabilities(class_output: dict) -> list[dict[str, float]]:
+    """Return per-IC class probabilities from ``classify_ica`` output.
+
+    Parameters
+    ----------
+    class_output
+        Output dictionary returned by :func:`MEGnet.prep_inputs.ICA.classify_ica`.
+
+    Returns
+    -------
+    list of dict
+        One entry per IC component. Each dictionary maps class labels
+        (``Neural/other``, ``Eye blink (VEOG)``, ``Cardiac (ECG/EKG)``,
+        ``Horizontal eye movement (saccade/HEOG)``) to probability values.
+    """
+    probs = class_output.get("class_probabilities")
+    if probs is None:
+        classes = _to_int_list(class_output.get("classes", []))
+        if len(classes) == 0:
+            return []
+        probs = np.eye(len(CLASS_ID_TO_NAME), dtype=float)[classes]
+
+    prob_arr = np.asarray(probs, dtype=float)
+    if prob_arr.ndim != 2:
+        raise ValueError(f"Expected a 2D probability array, got shape {prob_arr.shape}")
+
+    ordered_class_ids = sorted(CLASS_ID_TO_NAME)
+    if prob_arr.shape[1] != len(ordered_class_ids):
+        raise ValueError(
+            "Probability output shape does not match expected class count: "
+            f"{prob_arr.shape[1]} vs {len(ordered_class_ids)}"
+        )
+
+    return [
+        {
+            CLASS_ID_TO_NAME[class_id]: float(prob_arr[comp_idx, class_id])
+            for class_id in ordered_class_ids
+        }
+        for comp_idx in range(prob_arr.shape[0])
+    ]
+
+
+def get_ic_class_probabilities(results_dir: str, filename: str, outbasename: str | None = None) -> list[dict[str, float]]:
+    """Classify ICA outputs and return per-IC class probabilities.
+
+    This is a convenience API for programmatic use of the wrapper when only
+    component probabilities are needed.
+    """
+    class_output = classify_ica(
+        results_dir=results_dir,
+        outbasename=outbasename,
+        filename=filename,
+    )
+    return get_ic_probabilities(class_output)
+
+
 def _apply_ica_cleanup(
     raw_dataset: str, ica_path: str, bads_idx: list[int], out_clean_path: str, out_ica_applied_path: str
 ) -> None:
@@ -828,7 +884,9 @@ def main() -> int:
         return 1
     classes = _to_int_list(class_output["classes"])
     bads_idx = sorted(set(_to_int_list(class_output["bads_idx"])))
+    class_probabilities = get_ic_probabilities(class_output)
     report.update(_build_report(file_base=file_base, classes=classes, bads_idx=bads_idx))
+    report["class_probabilities"] = class_probabilities
     _write_report(report_path, report)
 
     preproc_fif = op.join(results_subdir, f"{file_base}_250srate_meg.fif")
@@ -916,6 +974,10 @@ def main() -> int:
     print(f"Predicted class IDs for components 1..20: {classes}")
     print(f"Predicted removable components (0-based): {bads_idx}")
     print(f"Predicted removable components (1-based): {[idx + 1 for idx in bads_idx]}")
+    print("Per-IC class probabilities:")
+    for ic_idx, prob_map in enumerate(class_probabilities, start=1):
+        formatted = ", ".join(f"{label}={prob:.4f}" for label, prob in prob_map.items())
+        print(f"  IC{ic_idx:02d}: {formatted}")
     if args.run_ref_compare and "reference_comparison" in report:
         print(f"Reference comparison status: {report['reference_comparison'].get('status')}")
     print(f"Summary report: {report_path}")
