@@ -275,7 +275,10 @@ def fPredictChunkAndVoting(kModel, lTimeSeries, arrSpatialMap, arrY, intModelLen
 
         arrScanPrediction = np.stack(list(dctWeightedPredictions.values()))
         arrScanPrediction = arrScanPrediction.mean(axis=0)
-        arrScanPrediction = arrScanPrediction/arrScanPrediction.sum()
+        # Normalize probabilities per IC component (row-wise), not globally.
+        row_sums = arrScanPrediction.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        arrScanPrediction = arrScanPrediction / row_sums
         lPredictionsVote.append(arrScanPrediction)
         lGTVote.append(arrScanY)
         
@@ -413,7 +416,10 @@ def fPredictChunkAndVoting_parrallel(kModel, lTimeSeries, arrSpatialMap, intMode
 
         arrScanPrediction = np.stack(list(dctWeightedPredictions.values()))
         arrScanPrediction = arrScanPrediction.mean(axis=0)
-        arrScanPrediction = arrScanPrediction/arrScanPrediction.sum()
+        # Normalize probabilities per IC component (row-wise), not globally.
+        row_sums = arrScanPrediction.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        arrScanPrediction = arrScanPrediction / row_sums
         lPredictionsVote.append(arrScanPrediction)
         allChunkPredictions.append(np.stack(lPredictionsChunk, axis=-1))
         i+=1
