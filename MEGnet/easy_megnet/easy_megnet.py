@@ -766,9 +766,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional output directory for IC-vs-reference comparison plots.",
     )
     parser.add_argument(
-        "--report-file",
-        default=None,
-        help="Optional JSON report path. Default: <results-subdir>/megnet_summary.json",
+        "--require-soft-probabilities",
+        action="store_true",
+        help="Fail if probabilities are unavailable or appear one-hot for all ICs.",
     )
     return parser
 
