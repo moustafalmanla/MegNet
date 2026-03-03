@@ -843,6 +843,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fail if probabilities are unavailable or appear one-hot for all ICs.",
     )
+    parser.add_argument(
+        "--require-soft-probabilities",
+        action="store_true",
+        help="Fail if probabilities are unavailable or appear one-hot for all ICs.",
+    )
     return parser
 
 
@@ -866,7 +871,7 @@ def main() -> int:
     file_base = _file_base(args.filename, args.outbasename)
     results_subdir = op.join(args.results_dir, file_base)
     os.makedirs(results_subdir, exist_ok=True)
-    report_path = args.report_file or op.join(results_subdir, "megnet_summary.json")
+    report_path = getattr(args, "report_file", None) or op.join(results_subdir, "megnet_summary.json")
 
     report: dict = {
         "file_base": file_base,
