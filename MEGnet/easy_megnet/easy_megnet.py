@@ -747,7 +747,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Run MEGnet preprocessing + ICA + classification + optional ICA application "
             "in one command."
-        )
+        ),
+        conflict_handler="resolve",
     )
     parser.add_argument(
         "--filename",
@@ -826,6 +827,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--compare-out-dir",
         default=None,
         help="Optional output directory for IC-vs-reference comparison plots.",
+    )
+    parser.add_argument(
+        "--require-soft-probabilities",
+        action="store_true",
+        help="Fail if probabilities are unavailable or appear one-hot for all ICs.",
     )
     parser.add_argument(
         "--require-soft-probabilities",
