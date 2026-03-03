@@ -829,9 +829,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional output directory for IC-vs-reference comparison plots.",
     )
     parser.add_argument(
-        "--report-file",
-        default=None,
-        help="Optional JSON report path. Default: <results-subdir>/megnet_summary.json",
+        "--require-soft-probabilities",
+        action="store_true",
+        help="Fail if probabilities are unavailable or appear one-hot for all ICs.",
+    )
+    parser.add_argument(
+        "--require-soft-probabilities",
+        action="store_true",
+        help="Fail if probabilities are unavailable or appear one-hot for all ICs.",
+    )
+    parser.add_argument(
+        "--require-soft-probabilities",
+        action="store_true",
+        help="Fail if probabilities are unavailable or appear one-hot for all ICs.",
     )
     parser.add_argument(
         "--require-soft-probabilities",
@@ -967,8 +977,7 @@ def main() -> int:
         report.setdefault("warnings", []).append(
             "All IC probabilities are one-hot-like (0/1). Output may be hard labels rather than soft confidences."
         )
-    require_soft = bool(getattr(args, "require_soft_probabilities", False))
-    if require_soft and (used_probability_fallback or probability_quality.get("all_one_hot_like")):
+    if args.require_soft_probabilities and (used_probability_fallback or probability_quality.get("all_one_hot_like")):
         report["status"] = "failed"
         report["stages"]["classify"] = {
             "status": "failed",
