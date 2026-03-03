@@ -452,6 +452,124 @@ def _build_report(file_base: str, classes: list[int], bads_idx: list[int]) -> di
     }
 
 
+def get_ic_probabilities(class_output: dict) -> list[dict[str, float]]:
+    """Return per-IC class probabilities from ``classify_ica`` output.
+
+    Parameters
+    ----------
+    class_output
+        Output dictionary returned by :func:`MEGnet.prep_inputs.ICA.classify_ica`.
+
+    Returns
+    -------
+    list of dict
+        One entry per IC component. Each dictionary maps class labels
+        (``Neural/other``, ``Eye blink (VEOG)``, ``Cardiac (ECG/EKG)``,
+        ``Horizontal eye movement (saccade/HEOG)``) to probability values.
+    """
+    probs = class_output.get("class_probabilities")
+    if probs is None:
+        classes = _to_int_list(class_output.get("classes", []))
+        if len(classes) == 0:
+            return []
+        probs = np.eye(len(CLASS_ID_TO_NAME), dtype=float)[classes]
+
+    prob_arr = np.asarray(probs, dtype=float)
+    if prob_arr.ndim != 2:
+        raise ValueError(f"Expected a 2D probability array, got shape {prob_arr.shape}")
+
+    ordered_class_ids = sorted(CLASS_ID_TO_NAME)
+    if prob_arr.shape[1] != len(ordered_class_ids):
+        raise ValueError(
+            "Probability output shape does not match expected class count: "
+            f"{prob_arr.shape[1]} vs {len(ordered_class_ids)}"
+        )
+
+    return [
+        {
+            CLASS_ID_TO_NAME[class_id]: float(prob_arr[comp_idx, class_id])
+            for class_id in ordered_class_ids
+        }
+        for comp_idx in range(prob_arr.shape[0])
+    ]
+
+
+def get_ic_class_probabilities(results_dir: str, filename: str, outbasename: str | None = None) -> list[dict[str, float]]:
+    """Classify ICA outputs and return per-IC class probabilities.
+
+    This is a convenience API for programmatic use of the wrapper when only
+    component probabilities are needed.
+    """
+    class_output = classify_ica(
+        results_dir=results_dir,
+        outbasename=outbasename,
+        filename=filename,
+    )
+    return get_ic_probabilities(class_output)
+
+
+
+def get_artifact_probabilities(ic_probabilities: list[dict[str, float]]) -> list[dict[str, float]]:
+    """Return per-IC ocular (EOG) and cardiac (ECG) probabilities.
+
+    EOG is the sum of vertical and horizontal ocular classes.
+    """
+    out: list[dict[str, float]] = []
+    for comp_idx, prob_map in enumerate(ic_probabilities):
+        eog_prob = float(prob_map.get("Eye blink (VEOG)", 0.0) + prob_map.get("Horizontal eye movement (saccade/HEOG)", 0.0))
+        ecg_prob = float(prob_map.get("Cardiac (ECG/EKG)", 0.0))
+        out.append(
+            {
+                "component_index_0based": comp_idx,
+                "component_number_1based": comp_idx + 1,
+                "eog_probability": eog_prob,
+                "ecg_probability": ecg_prob,
+            }
+        )
+    return out
+
+
+def rank_ic_candidates(
+    artifact_probs: list[dict[str, float]], artifact_key: str, top_k: int = 2, min_probability: float | None = None
+) -> list[dict[str, float]]:
+    """Rank ICs by a chosen artifact probability key and return top candidates."""
+    ranked = sorted(artifact_probs, key=lambda row: row[artifact_key], reverse=True)
+    if min_probability is not None:
+        ranked = [row for row in ranked if row[artifact_key] >= float(min_probability)]
+    return ranked[: max(0, int(top_k))]
+
+
+
+def summarize_probability_quality(ic_probabilities: list[dict[str, float]], atol: float = 1e-6) -> dict[str, float | int | bool]:
+    """Summarize whether per-IC probabilities look like soft distributions."""
+    if len(ic_probabilities) == 0:
+        return {
+            "n_components": 0,
+            "row_sum_min": float("nan"),
+            "row_sum_max": float("nan"),
+            "one_hot_like_count": 0,
+            "all_one_hot_like": False,
+        }
+
+    arr = np.array([list(row.values()) for row in ic_probabilities], dtype=float)
+    row_sums = arr.sum(axis=1)
+
+    one_hot_like = 0
+    for row in arr:
+        close_to_one = np.isclose(row, 1.0, atol=atol)
+        close_to_zero = np.isclose(row, 0.0, atol=atol)
+        if np.sum(close_to_one) == 1 and np.all(np.logical_or(close_to_one, close_to_zero)):
+            one_hot_like += 1
+
+    return {
+        "n_components": int(arr.shape[0]),
+        "row_sum_min": float(np.min(row_sums)),
+        "row_sum_max": float(np.max(row_sums)),
+        "one_hot_like_count": int(one_hot_like),
+        "all_one_hot_like": bool(one_hot_like == arr.shape[0]),
+    }
+
+
 def _apply_ica_cleanup(
     raw_dataset: str, ica_path: str, bads_idx: list[int], out_clean_path: str, out_ica_applied_path: str
 ) -> None:
@@ -710,9 +828,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional output directory for IC-vs-reference comparison plots.",
     )
     parser.add_argument(
-        "--report-file",
-        default=None,
-        help="Optional JSON report path. Default: <results-subdir>/megnet_summary.json",
+        "--require-soft-probabilities",
+        action="store_true",
+        help="Fail if probabilities are unavailable or appear one-hot for all ICs.",
     )
     return parser
 
@@ -828,7 +946,41 @@ def main() -> int:
         return 1
     classes = _to_int_list(class_output["classes"])
     bads_idx = sorted(set(_to_int_list(class_output["bads_idx"])))
+    used_probability_fallback = class_output.get("class_probabilities") is None
+    class_probabilities = get_ic_probabilities(class_output)
+    probability_quality = summarize_probability_quality(class_probabilities)
+    artifact_probabilities = get_artifact_probabilities(class_probabilities)
+    top_eog = rank_ic_candidates(artifact_probabilities, artifact_key="eog_probability", top_k=2)
+    top_ecg = rank_ic_candidates(artifact_probabilities, artifact_key="ecg_probability", top_k=2)
+
+    if used_probability_fallback:
+        report.setdefault("warnings", []).append(
+            "class_probabilities missing from classifier output; falling back to one-hot probabilities from class labels."
+        )
+    if probability_quality.get("all_one_hot_like"):
+        report.setdefault("warnings", []).append(
+            "All IC probabilities are one-hot-like (0/1). Output may be hard labels rather than soft confidences."
+        )
+    if args.require_soft_probabilities and (used_probability_fallback or probability_quality.get("all_one_hot_like")):
+        report["status"] = "failed"
+        report["stages"]["classify"] = {
+            "status": "failed",
+            "error": {
+                "type": "ProbabilityQualityError",
+                "message": "Soft class probabilities were required, but classifier output was one-hot/fallback.",
+            },
+        }
+        report["class_probability_diagnostics"] = probability_quality
+        _write_report(report_path, report)
+        print("Soft probabilities were requested but unavailable/one-hot-like.")
+        print(f"Summary report: {report_path}")
+        return 1
+
     report.update(_build_report(file_base=file_base, classes=classes, bads_idx=bads_idx))
+    report["class_probabilities"] = class_probabilities
+    report["class_probability_diagnostics"] = probability_quality
+    report["artifact_probabilities"] = artifact_probabilities
+    report["top_artifact_candidates"] = {"eog": top_eog, "ecg": top_ecg}
     _write_report(report_path, report)
 
     preproc_fif = op.join(results_subdir, f"{file_base}_250srate_meg.fif")
@@ -916,6 +1068,25 @@ def main() -> int:
     print(f"Predicted class IDs for components 1..20: {classes}")
     print(f"Predicted removable components (0-based): {bads_idx}")
     print(f"Predicted removable components (1-based): {[idx + 1 for idx in bads_idx]}")
+    print("Per-IC class probabilities:")
+    for ic_idx, prob_map in enumerate(class_probabilities, start=1):
+        formatted = ", ".join(f"{label}={prob:.4f}" for label, prob in prob_map.items())
+        print(f"  IC{ic_idx:02d}: {formatted}")
+
+    print(
+        "Probability diagnostics: "
+        f"row_sum_min={probability_quality['row_sum_min']:.6f}, "
+        f"row_sum_max={probability_quality['row_sum_max']:.6f}, "
+        f"one_hot_like={probability_quality['one_hot_like_count']}/{probability_quality['n_components']}"
+    )
+
+    print("Top EOG-probability IC candidates:")
+    for row in top_eog:
+        print(f"  IC{int(row['component_number_1based']):02d}: p(EOG)={row['eog_probability']:.4f}")
+
+    print("Top ECG-probability IC candidates:")
+    for row in top_ecg:
+        print(f"  IC{int(row['component_number_1based']):02d}: p(ECG)={row['ecg_probability']:.4f}")
     if args.run_ref_compare and "reference_comparison" in report:
         print(f"Reference comparison status: {report['reference_comparison'].get('status')}")
     print(f"Summary report: {report_path}")
